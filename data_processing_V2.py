@@ -1,147 +1,143 @@
 # filepath: data_processing.py
 
+"""
+Pipeline de préparation des données BiodCase
+=============================================
+Fix principal : audio_start est extrait du nom du fichier WAV
+et passé explicitement à extract_patch.
+"""
+
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import librosa
 import cv2
-from scipy.io import wavfile
-from scipy.signal import spectrogram as scipy_spectrogram
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
 class Config:
     BASE_DIR    = Path(__file__).resolve().parent
     DATA_ROOT   = Path(r"C:\ENSTA\2A\S4\Machine_learning\Projet\biodcase_development_set\biodcase_development_set")
     OUTPUT_ROOT = BASE_DIR / "dataset_prepared"
 
-    SR            = 250
-    N_FFT         = 512      # 0.49 Hz/bin → même résolution que pipeline de référence
-    HOP_LENGTH    = 64       # frame = 256 ms
+    SR            = 200
+    N_FFT         = 512
+    HOP_LENGTH    = 64
+    N_MELS        = 128
     F_MIN         = 0
     F_MAX         = None
 
     IMG_SIZE      = (128, 128)
+    RESIZE_METHOD = "resize"
     DYNAMIC_RANGE = 80
-
 
 
 cfg = Config()
 
 
+# ─────────────────────────────────────────────
+# UTILITAIRE : timestamp de début du fichier WAV
+# ─────────────────────────────────────────────
+
 def get_audio_start(wav_path: Path) -> pd.Timestamp:
-    stem      = wav_path.stem
-    date_part = stem.split("_")[0]
-    date_str, time_str = date_part.split("T")
-    time_str  = time_str.replace("-", ":")
+    """
+    Extrait le timestamp de début depuis le nom du fichier WAV.
+    Convention BiodCase : 2015-02-04T03-00-00_000.wav
+    Les '-' dans la partie heure sont remplacés par ':'.
+    """
+    stem      = wav_path.stem                     # "2015-02-04T03-00-00_000"
+    date_part = stem.split("_")[0]                # "2015-02-04T03-00-00"
+    date_str, time_str = date_part.split("T")     # "2015-02-04", "03-00-00"
+    time_str  = time_str.replace("-", ":")        # "03:00:00"
     return pd.Timestamp(f"{date_str}T{time_str}+00:00")
 
 
+# ─────────────────────────────────────────────
+# SPECTROGRAMME
+# ─────────────────────────────────────────────
+
 def compute_spectrogram(wav_path: Path):
-    sr_orig, data = wavfile.read(wav_path)
+    y, sr = librosa.load(wav_path, sr=cfg.SR, mono=True)
 
-    if data.dtype == np.int16:
-        data = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        data = data.astype(np.float32) / 2147483648.0
-    else:
-        data = data.astype(np.float32)
-
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-
-    if sr_orig != cfg.SR:
-        num_samples = int(len(data) * cfg.SR / sr_orig)
-        data = np.interp(
-            np.linspace(0, len(data), num_samples),
-            np.arange(len(data)),
-            data,
-        ).astype(np.float32)
-    sr = cfg.SR
-
-    freqs, times, Sxx = scipy_spectrogram(
-        data,
-        fs       = sr,
-        window   = "hann",
-        nperseg  = cfg.N_FFT,
-        noverlap = cfg.N_FFT - cfg.HOP_LENGTH,
-        scaling  = "density",
-        mode     = "psd",
+    S = librosa.feature.melspectrogram(
+        y=y, sr=sr,
+        n_fft=cfg.N_FFT,
+        hop_length=cfg.HOP_LENGTH,
+        n_mels=cfg.N_MELS,
+        fmin=cfg.F_MIN,
+        fmax=cfg.F_MAX,
     )
-
-    Sxx_db = 10.0 * np.log10(np.maximum(Sxx, 1e-10))
-    Sxx_db = Sxx_db - Sxx_db.max()
-    Sxx_db = np.maximum(Sxx_db, -cfg.DYNAMIC_RANGE)
-
+    S_db    = librosa.power_to_db(S, ref=np.max, top_db=cfg.DYNAMIC_RANGE)
     hop_sec = cfg.HOP_LENGTH / sr
-    return Sxx_db, hop_sec, freqs
+    return S_db, hop_sec
 
+
+# ─────────────────────────────────────────────
+# EXTRACTION DU PATCH
+# ─────────────────────────────────────────────
 
 def extract_patch(
     S_db:        np.ndarray,
     hop_sec:     float,
-    audio_start: pd.Timestamp,
-    freqs:       np.ndarray,
+    audio_start: pd.Timestamp,   # ← passé explicitement, plus de variable globale
     row:         pd.Series,
 ) -> np.ndarray | None:
-    """
-    Crop exact sur la bbox d'annotation — même logique que le pipeline de référence.
-    Utilise np.searchsorted comme lui pour trouver les indices temps et fréquence.
-    """
+
     t0 = pd.to_datetime(row["start_datetime"], utc=True)
     t1 = pd.to_datetime(row["end_datetime"],   utc=True)
 
     # Temps relatifs au début du fichier audio
-    t_start = (t0 - audio_start).total_seconds()
-    t_end   = (t1 - audio_start).total_seconds()
+    t0_rel = (t0 - audio_start).total_seconds()
+    t1_rel = (t1 - audio_start).total_seconds()
 
-    # Axe temporel en secondes (même que librosa.frames_to_time)
-    n_frames = S_db.shape[1]
-    times    = np.arange(n_frames) * hop_sec
+    # ── Diagnostic silencieux si hors fichier ──────────────────────────
+    duration_audio = S_db.shape[1] * hop_sec
+    if t1_rel <= 0 or t0_rel >= duration_audio:
+        return None   # annotation ne chevauche pas ce fichier
+    # ───────────────────────────────────────────────────────────────────
 
-    # Indices temps — searchsorted comme dans le code de référence
-    col_start = np.searchsorted(times, t_start)
-    col_end   = np.searchsorted(times, t_end)
+    col0 = int(t0_rel / hop_sec)
+    col1 = int(t1_rel / hop_sec)
 
-    # Indices fréquence — fréquences croissantes, low → bas, high → haut
-    row_low  = np.searchsorted(freqs, row["low_frequency"])
-    row_high = np.searchsorted(freqs, row["high_frequency"])
+    freq_axis = librosa.mel_frequencies(n_mels=cfg.N_MELS, fmin=cfg.F_MIN, fmax=cfg.F_MAX or cfg.SR / 2)
+    row0 = int(np.argmin(np.abs(freq_axis - row["high_frequency"])))
+    row1 = int(np.argmin(np.abs(freq_axis - row["low_frequency"])))
 
-    # Vérification des bornes
-    if col_start >= col_end or row_low >= row_high:
-        return None
-    if col_end > S_db.shape[1] or row_high > S_db.shape[0]:
-        return None
+    n_freq, n_frames = S_db.shape
+    col0 = max(0, min(col0, n_frames - 1))
+    col1 = max(col0 + 1, min(col1, n_frames))
+    row0 = max(0, min(row0, n_freq - 1))
+    row1 = max(row0 + 1, min(row1, n_freq))
 
-    # Crop exact sur la bbox
-    patch = S_db[row_low:row_high, col_start:col_end]
+    return S_db[row0:row1, col0:col1]
 
-    # Inverser l'axe fréquence (basses fréquences en bas) — comme lui
-    patch = patch[::-1, :]
 
-    return patch
-
+# ─────────────────────────────────────────────
+# NORMALISATION IMAGE
+# ─────────────────────────────────────────────
 
 def normalize_patch(patch: np.ndarray) -> np.ndarray:
-    """
-    Normalisation simple min/max → [0, 255], niveaux de gris.
-    Même approche que le pipeline librosa de référence (camarade).
-    Pas de soustraction de médiane qui détruit le signal sur les petits patches.
-    """
     h, w = cfg.IMG_SIZE
-
     p_min, p_max = patch.min(), patch.max()
-    if p_max - p_min < 1e-6:
-        img = np.zeros(patch.shape, dtype=np.uint8)
-    else:
+    if p_max > p_min:
         img = ((patch - p_min) / (p_max - p_min) * 255).astype(np.uint8)
-
+    else:
+        img = np.zeros(patch.shape, dtype=np.uint8)
     return cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
 
+
+# ─────────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────────
 
 def process_split(split: str):
     audio_root = cfg.DATA_ROOT / split / "audio"
@@ -176,17 +172,18 @@ def _process_wav(wav_path: Path, df: pd.DataFrame, out_root: Path) -> int:
     if rows.empty:
         return 0
 
+    # Timestamp de début extrait du nom du fichier
     try:
         audio_start = get_audio_start(wav_path)
     except Exception as e:
         logger.warning("Impossible de parser le timestamp de %s : %s", filename, e)
         return 0
 
-    S_db, hop_sec, freqs = compute_spectrogram(wav_path)
+    S_db, hop_sec = compute_spectrogram(wav_path)
 
     count = 0
     for idx, row in rows.iterrows():
-        patch = extract_patch(S_db, hop_sec, audio_start, freqs, row)
+        patch = extract_patch(S_db, hop_sec, audio_start, row)
         if patch is None:
             continue
 
@@ -201,9 +198,13 @@ def _process_wav(wav_path: Path, df: pd.DataFrame, out_root: Path) -> int:
     return count
 
 
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def main():
     logger.info("DATA ROOT : %s", cfg.DATA_ROOT)
-    logger.info("Existe    : %s", cfg.DATA_ROOT.exists())
+    logger.info("Existe   : %s", cfg.DATA_ROOT.exists())
 
     cfg.OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
